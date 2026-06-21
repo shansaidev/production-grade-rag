@@ -871,12 +871,9 @@ ollama list
 git clone https://github.com/yourname/production-rag.git
 cd production-rag
 
-# Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate
+# Install dependencies (uv creates .venv automatically)
+uv sync
 
-# Upgrade pip
-python -m pip install --upgrade pip
 ```
 
 #### Step 5: Start Infrastructure with Docker
@@ -896,7 +893,7 @@ docker exec -it rag_postgres psql -U raguser -d ragdb -c "CREATE EXTENSION IF NO
 
 ```powershell
 # Install Python dependencies
-pip install -r requirements.txt
+uv sync
 
 # Run migrations
 python -m alembic upgrade head
@@ -951,7 +948,7 @@ curl -X POST http://localhost:8000/api/v1/query/sync \
 production-rag/
 ├── docker-compose.yml
 ├── .env.example
-├── requirements.txt
+├── pyproject.toml
 ├── alembic.ini
 │
 ├── alembic/
@@ -1107,7 +1104,7 @@ volumes:
   minio_data:
 ```
 
-**`requirements.txt`**
+**`pyproject.toml`**
 ```
 # Core
 fastapi==0.115.0
@@ -3368,7 +3365,7 @@ ORDER BY date DESC;
 ### 15.11 Install Dependencies
 
 ```bash
-# Add to requirements.txt
+# Add via: uv add
 redisvl==0.3.6         # Redis vector library (SemanticCache, HNSW indexing)
 langchain-redis==0.1.0 # LangChain Redis integration
 redis[asyncio]==5.0.1  # Async Redis client
@@ -3394,7 +3391,7 @@ The similarity threshold is the most important tuning parameter:
 ### 15.13 Updated Requirements.txt
 
 ```
-# ADD to existing requirements.txt:
+# ADD via: uv add
 redisvl==0.3.6
 langchain-redis==0.1.0
 

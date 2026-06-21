@@ -1715,6 +1715,286 @@ Rule of thumb:
   If quality is paramount → Cohere or ColBERT.
 ```
 
+### The N >> K Ratio Principle (Critical for Reranker Effectiveness)
+
+The single most important configuration decision when adding a reranker:
+
+```
+N = number of candidates retrieved (prefetch from Qdrant)
+K = number of chunks sent to LLM after reranking
+
+The reranker is ONLY effective when N >> K.
+
+WHY:
+  If N=10 and K=8, the reranker has almost nothing to work with.
+  It can only reorder 10 items → select top 8 → marginal benefit.
+  You've added 150ms latency for almost no quality gain.
+
+  If N=50 and K=5, the reranker compresses 50 → 5.
+  It discards 45 irrelevant/noisy chunks.
+  Precision improvement is dramatic.
+
+PRODUCTION DEFAULT: N=50, K=5 (10:1 ratio)
+  "Cast a wide net to guarantee recall,
+   then ruthlessly curate for precision."
+
+MINIMUM VIABLE: N=20, K=5 (4:1 ratio)
+  Acceptable if Qdrant latency is a concern.
+
+NEVER DO: N=10, K=8 (1.25:1 ratio)
+  Adds latency, provides almost zero benefit.
+
+In your system:
+  QDRANT_PREFETCH_DENSE  = 50   ← N (in .env)
+  QDRANT_PREFETCH_SPARSE = 50   ← N
+  top_k_final            = 5    ← K (after reranker)
+
+Assert this at startup:
+  assert top_k_final * 6 <= prefetch_limit, "N:K ratio too low"
+```
+
+### Reranker Type 6: Rule-Based Reranking
+
+Not all reranking requires a model. Rule-based score adjustments are fast (sub-millisecond), free, and often highly effective for domain-specific systems.
+
+```
+APPLY AFTER the cross-encoder score, as a score multiplier:
+
+final_score = cross_encoder_score
+              × recency_factor(chunk.created_at)
+              × authority_weight(chunk.doc_type)
+              × keyword_boost(query, chunk.text)
+
+1. RECENCY FACTOR:
+   Newer documents should rank higher for volatile information.
+   recency_factor = 1.0 + (recency_weight × decay)
+   decay = 1 / (1 + days_since_created / 30)
+
+   Example:
+     chunk created 1 day ago:  decay=0.97 → boost = 1.19 (with weight=0.2)
+     chunk created 30 days ago: decay=0.5 → boost = 1.10
+     chunk created 1 year ago:  decay=0.08 → boost = 1.02
+
+   Config: RECENCY_WEIGHT=0.2 in .env (0=disabled, 0.5=strong boost)
+   Use when: policy documents, news, version-sensitive content
+
+2. AUTHORITY WEIGHT (document type hierarchy):
+   Some document types are more authoritative than others.
+   
+   authority_weight by doc_type:
+     "policy"     → 1.3   (official policy: highest authority)
+     "procedure"  → 1.2   (official procedure)
+     "faq"        → 1.1   (official FAQ)
+     "email"      → 0.9   (informal, may be outdated)
+     "chat_log"   → 0.8   (least authoritative)
+     default      → 1.0
+
+   Use when: corpus has mixed document types of varying reliability
+
+3. EXACT KEYWORD BOOST:
+   If the query contains an exact term that appears verbatim in the chunk
+   (product codes, error codes, policy IDs), boost that chunk.
+   
+   boost = 1.0
+   for term in query.split():
+       if len(term) > 4 and term in chunk.text:
+           boost += 0.15
+   keyword_boost = min(boost, 1.5)  # cap at 1.5×
+
+   Use when: technical docs with error codes, IDs, model numbers
+
+Implementation:
+  def rule_based_score(
+      base_score: float,
+      created_at: datetime,
+      doc_type: str,
+      chunk_text: str,
+      query: str,
+  ) -> float:
+      recency = 1.0 + 0.2 * (1 / (1 + (datetime.now() - created_at).days / 30))
+      authority = {"policy":1.3,"procedure":1.2,"faq":1.1,"email":0.9}.get(doc_type, 1.0)
+      kw_boost = min(1.0 + 0.15 * sum(
+          1 for t in query.split() if len(t)>4 and t.lower() in chunk_text.lower()
+      ), 1.5)
+      return base_score * recency * authority * kw_boost
+```
+
+### MMR — Maximal Marginal Relevance (Diversity Reranking)
+
+MMR solves a different problem from cross-encoders: instead of finding the most relevant chunks, it finds the most *useful* set — maximising relevance while minimising redundancy.
+
+```
+PROBLEM MMR SOLVES:
+  After cross-encoder reranking, your top-5 chunks may all be:
+    "California employees get 12 weeks of parental leave..."
+    "Under CFRA, California provides 12 weeks..."
+    "The parental leave policy for CA: 12 weeks..."
+  All highly relevant. All saying the same thing.
+  You've wasted 3 of 5 context slots on redundant information.
+
+MMR ALGORITHM:
+  For each iteration, select the chunk that maximises:
+  MMR(doc) = λ × sim(doc, query) - (1-λ) × max(sim(doc, already_selected))
+  
+  Where:
+    λ = balance parameter (0.0 to 1.0)
+    λ=1.0 → pure relevance (standard ranked retrieval, no diversity)
+    λ=0.0 → pure diversity (maximise coverage, ignore relevance)
+    λ=0.5 → balanced (recommended default)
+
+  Step by step:
+    1. Start with the single most relevant chunk → selected = [chunk_1]
+    2. For remaining candidates, score each by MMR formula
+    3. Select the chunk with highest MMR score → add to selected
+    4. Repeat until K chunks selected
+
+WHY THIS WORKS:
+  The subtracted term max(sim(doc, already_selected)) penalises chunks
+  that are similar to what you've already selected.
+  A chunk saying "12 weeks" for the 4th time gets a big penalty.
+  A chunk about the APPLICATION PROCESS gets no penalty (novel information).
+
+λ TUNING GUIDE:
+  λ=0.7  → Mostly relevance, slight diversity. Good for factual queries.
+  λ=0.5  → Balanced. Good for analytical/comparative queries.
+  λ=0.3  → Strong diversity. Good for summarisation tasks.
+
+Implementation (applies after FlashRank, before context assembly):
+  import numpy as np
+  from sklearn.metrics.pairwise import cosine_similarity
+
+  def mmr_select(
+      query_vec: list[float],
+      chunk_vecs: list[list[float]],
+      chunks: list[dict],
+      k: int = 5,
+      lambda_param: float = 0.5,
+  ) -> list[dict]:
+      if not chunks:
+          return []
+      
+      q = np.array(query_vec).reshape(1, -1)
+      C = np.array(chunk_vecs)
+      
+      # Similarity of each chunk to query
+      query_sims = cosine_similarity(q, C)[0]
+      
+      selected_idx = []
+      remaining_idx = list(range(len(chunks)))
+      
+      while len(selected_idx) < k and remaining_idx:
+          if not selected_idx:
+              # First: pick most relevant
+              best = max(remaining_idx, key=lambda i: query_sims[i])
+          else:
+              # MMR: balance relevance vs diversity
+              selected_vecs = C[selected_idx]
+              best_score = -np.inf
+              best = remaining_idx[0]
+              for i in remaining_idx:
+                  relevance = query_sims[i]
+                  redundancy = cosine_similarity(C[i:i+1], selected_vecs).max()
+                  score = lambda_param * relevance - (1 - lambda_param) * redundancy
+                  if score > best_score:
+                      best_score, best = score, i
+          
+          selected_idx.append(best)
+          remaining_idx.remove(best)
+      
+      return [chunks[i] for i in selected_idx]
+```
+
+### Parallel LLM Reranking (Production Pattern)
+
+When LLM reranking quality is needed but latency is a concern, shard the candidates across parallel LLM calls:
+
+```
+NAIVE LLM RERANKING (slow):
+  50 candidates → 1 LLM call with all 50 → wait 5-10s
+
+PARALLEL LLM RERANKING (fast):
+  50 candidates → 10 shards of 5 → 10 parallel LLM calls → merge
+  Each call: smaller prompt → faster model → cheaper → parallel execution
+  Result: ~2-3× faster, significantly cheaper
+
+  Implementation:
+    async def parallel_llm_rerank(query, chunks, shard_size=5):
+        shards = [chunks[i:i+shard_size] for i in range(0, len(chunks), shard_size)]
+        tasks = [score_shard(query, shard) for shard in shards]
+        scored_shards = await asyncio.gather(*tasks)
+        all_scored = [item for shard in scored_shards for item in shard]
+        return sorted(all_scored, key=lambda x: x["score"], reverse=True)[:top_k]
+
+FALLBACK PATTERN:
+  If any shard LLM call times out → fall back to FlashRank for that shard
+  This makes LLM reranking resilient to partial failures.
+
+When to use:
+  LLM reranking quality is needed AND latency > 3s is acceptable
+  For your system: overkill. FlashRank + rule-based + MMR is sufficient.
+  Relevant if you scale to 100+ RPS and need highest quality.
+```
+
+### Reranking Evaluation Metrics
+
+Beyond RAGAS context_precision, two ranking-quality metrics measure reranker effectiveness:
+
+```
+NDCG@K (Normalised Discounted Cumulative Gain):
+  Measures: are the MOST relevant chunks ranked HIGHEST?
+  Range: 0.0 to 1.0 (1.0 = perfect ranking)
+
+  Algorithm:
+    DCG@k = Σ (relevance_i / log2(rank_i + 1))
+    NDCG@k = DCG@k / IDCG@k   (IDCG = ideal DCG with perfect ordering)
+
+  Requires graded relevance labels (not just binary):
+    2 = highly relevant (directly answers query)
+    1 = somewhat relevant (related but not direct answer)
+    0 = not relevant
+
+  from sklearn.metrics import ndcg_score
+  ndcg = ndcg_score([ground_truth_grades], [model_scores], k=5)
+
+  Target: NDCG@5 > 0.80 for production retrieval
+  What it tells you: did the reranker put the best chunks at the top?
+
+MRR (Mean Reciprocal Rank):
+  Measures: how early does the FIRST relevant chunk appear?
+  Range: 0.0 to 1.0
+
+  For each query: RR = 1 / rank_of_first_relevant_chunk
+  MRR = mean(RR) across all queries
+
+  Examples:
+    First relevant chunk at rank 1: RR = 1.0
+    First relevant chunk at rank 2: RR = 0.5
+    First relevant chunk at rank 5: RR = 0.2
+
+  Why it matters for RAG:
+    With "lost in the middle" effect, the model attends most to
+    position 1. MRR tells you whether your best chunk is at position 1.
+    High context_precision + low MRR = right chunks retrieved, wrong order.
+    Add reranker → MRR should jump significantly.
+
+  Implementation:
+    def mean_reciprocal_rank(relevant_ids: list[set], retrieved_ids: list[list]) -> float:
+        rrs = []
+        for rel, ret in zip(relevant_ids, retrieved_ids):
+            for rank, chunk_id in enumerate(ret, 1):
+                if chunk_id in rel:
+                    rrs.append(1.0 / rank)
+                    break
+            else:
+                rrs.append(0.0)
+        return sum(rrs) / len(rrs)
+
+Add both to evaluation/metrics.py alongside RAGAS:
+  Run on your 30-pair golden dataset (Thursday eval day).
+  Compare MRR before vs after reranker → should improve 0.15-0.40.
+  Compare NDCG@5 before vs after → should improve 0.05-0.20.
+```
+
 ---
 
 ## 17. HyDE — Hypothetical Document Embeddings

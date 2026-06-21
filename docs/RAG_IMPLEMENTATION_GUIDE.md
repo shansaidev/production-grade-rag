@@ -146,8 +146,8 @@ curl http://localhost:6333/healthz
 # Open: http://localhost:6333/dashboard
 
 # Python clients for both
-pip install asyncpg sqlalchemy[asyncio] alembic   # PostgreSQL
-pip install qdrant-client fastembed               # Qdrant
+uv add asyncpg "sqlalchemy[asyncio]" alembic   # PostgreSQL
+uv add qdrant-client fastembed               # Qdrant
 ```
 
 ### If You Want v1 Instead (pgvector only, no Qdrant)
@@ -157,7 +157,7 @@ Use `PRODUCTION_RAG_SYSTEM.md` as your reference. The only differences in implem
 - Add `embeddings` table with `VECTOR(1536)` column and HNSW index
 - Replace `HybridSearcher` (Qdrant) with the SQL hybrid search CTE from §5 of that doc
 - Remove Qdrant from docker-compose.yml
-- Remove `qdrant-client` and `fastembed` from requirements.txt
+- Remove via: uv remove qdrant-client fastembed
 - Everything else (FastAPI, LangGraph, Celery, validation, RAGAS) is identical
 
 ---
@@ -258,8 +258,7 @@ ollama pull llama3.2:8b        # 4.7 GB — LLM for generation
 # Step 4: Clone project and setup Python
 git clone https://github.com/yourname/production-rag.git
 cd production-rag
-python -m venv .venv && .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync  # creates .venv and installs all deps from pyproject.toml
 
 # Step 5: Start infrastructure
 docker compose up -d
@@ -1529,50 +1528,290 @@ async def test_metadata_update_no_reembed(coordinator, doc_id):
 
 ## 13. Phase 12 — Reranker + HyDE
 
-### Installing FlashRank
+### What to Build (Full Reranking Pipeline)
+
+```
+Qdrant hybrid search (N=50 candidates)
+    │
+    ▼
+Step 1: FlashRank cross-encoder  ← semantic relevance scoring
+    │  (50 → 20, ~150ms)
+    ▼
+Step 2: Rule-based score boost   ← recency + authority + keyword
+    │  (<1ms, uses payload metadata)
+    ▼
+Step 3: MMR diversity filter     ← remove redundant chunks
+    │  (20 → top_k=5, ~10ms)
+    ▼
+Context assembler                ← lost-in-middle ordering
+    │  (best=pos 0, 2nd-best=pos N-1)
+    ▼
+LLM generation (K=5 chunks)
+```
+
+**Enforce the N >> K ratio first** — add to `src/core/config.py`:
+```python
+# In Settings class — add validation
+@model_validator(mode='after')
+def check_nk_ratio(self):
+    assert self.top_k_final * 6 <= self.qdrant_prefetch_dense, (
+        f"N:K ratio too low: prefetch={self.qdrant_prefetch_dense}, "
+        f"top_k={self.top_k_final}. Need at least 6:1 ratio."
+    )
+    return self
+
+# In .env:
+# QDRANT_PREFETCH_DENSE=50   ← N
+# TOP_K_FINAL=5              ← K (NOT 8 — reduce from default)
+```
+
+### Step 1: FlashRank Cross-Encoder
 
 ```python
 # src/retrieval/reranker.py
 from flashrank import Ranker, RerankRequest
+from src.core.config import get_settings
+import time, structlog
 
+log = structlog.get_logger()
 _ranker = None
-def get_ranker():
+
+def get_ranker() -> Ranker:
     global _ranker
     if _ranker is None:
         _ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
     return _ranker
 
-def rerank(query: str, chunks: list[dict], top_n: int = 8) -> list[dict]:
-    """Rerank chunks using cross-encoder. Input: up to 50, output: top_n."""
+def cross_encoder_rerank(
+    query: str,
+    chunks: list[dict],
+    top_n: int = 20,   # intermediate: keep more for MMR step
+) -> list[dict]:
+    """Stage 1 of reranking: cross-encoder scores each chunk."""
+    start = time.perf_counter()
     ranker = get_ranker()
     passages = [{"id": i, "text": c["text"]} for i, c in enumerate(chunks)]
-    request = RerankRequest(query=query, passages=passages)
-    results = ranker.rerank(request)
-    reranked_ids = [r["id"] for r in results[:top_n]]
-    return [chunks[i] for i in reranked_ids]
+    results = ranker.rerank(RerankRequest(query=query, passages=passages))
+    reranked = [chunks[r["id"]] | {"ce_score": r["score"]} for r in results[:top_n]]
+    log.info("cross_encoder_rerank", input=len(chunks), output=len(reranked),
+             duration_ms=round((time.perf_counter()-start)*1000, 1))
+    return reranked
 ```
 
-### Measuring Reranker Impact
+### Step 2: Rule-Based Score Boost
 
 ```python
-# Run before and after adding reranker
-scores_without = await run_evaluation(pipeline_no_reranker, golden_path)
-scores_with    = await run_evaluation(pipeline_with_reranker, golden_path)
+# src/retrieval/rule_reranker.py
+from datetime import datetime, timezone
 
-print("=== RERANKER IMPACT ===")
-for metric in ["faithfulness", "answer_relevancy", "context_precision"]:
-    before = scores_without[metric]
-    after  = scores_with[metric]
-    delta  = after - before
-    print(f"{metric}: {before:.4f} → {after:.4f} ({'+' if delta > 0 else ''}{delta:.4f})")
+# Authority weights by document type — tune for your domain
+AUTHORITY = {
+    "policy":    1.30,
+    "procedure": 1.20,
+    "manual":    1.15,
+    "faq":       1.10,
+    "report":    1.05,
+    "email":     0.90,
+    "chat":      0.80,
+}
+
+def rule_based_boost(
+    chunks: list[dict],
+    query: str,
+    recency_weight: float = 0.20,   # 0=off, 0.5=strong
+    authority_on: bool = True,
+    keyword_on: bool = True,
+) -> list[dict]:
+    """
+    Apply deterministic score multipliers after cross-encoder.
+    Uses metadata already present in Qdrant payload (created_at, doc_type).
+    Sub-millisecond. No model call needed.
+    """
+    now = datetime.now(timezone.utc)
+    query_terms = {t.lower() for t in query.split() if len(t) > 4}
+    boosted = []
+
+    for chunk in chunks:
+        score = chunk.get("ce_score", 0.5)
+
+        # 1. Recency boost — newer docs rank higher
+        if recency_weight > 0 and chunk.get("created_at"):
+            created = chunk["created_at"]
+            if isinstance(created, (int, float)):
+                created = datetime.fromtimestamp(created, tz=timezone.utc)
+            days_old = max((now - created).days, 0)
+            decay = 1 / (1 + days_old / 30)
+            score *= 1.0 + recency_weight * decay
+
+        # 2. Authority weight — some doc types are more reliable
+        if authority_on:
+            doc_type = chunk.get("doc_type", "").lower()
+            score *= AUTHORITY.get(doc_type, 1.0)
+
+        # 3. Exact keyword boost — match exact query terms
+        if keyword_on and query_terms:
+            text_lower = chunk.get("text", "").lower()
+            matches = sum(1 for t in query_terms if t in text_lower)
+            score *= min(1.0 + 0.15 * matches, 1.5)  # cap at 1.5×
+
+        boosted.append({**chunk, "final_score": score})
+
+    return sorted(boosted, key=lambda x: x["final_score"], reverse=True)
+```
+
+### Step 3: MMR Diversity Filter
+
+```python
+# src/retrieval/mmr.py
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+def mmr_select(
+    query_vec: list[float],
+    chunks: list[dict],
+    chunk_vecs: list[list[float]],
+    k: int = 5,
+    lambda_param: float = 0.5,
+) -> list[dict]:
+    """
+    Maximal Marginal Relevance — select K diverse + relevant chunks.
+    Prevents context window being filled with near-duplicate chunks.
+
+    lambda_param:
+        1.0 = pure relevance (no diversity, same as top-k)
+        0.5 = balanced (default — good for most queries)
+        0.3 = strong diversity (good for summarisation)
+    """
+    if not chunks or k >= len(chunks):
+        return chunks[:k]
+
+    q = np.array(query_vec).reshape(1, -1)
+    C = np.array(chunk_vecs)
+    query_sims = cosine_similarity(q, C)[0]
+
+    selected, remaining = [], list(range(len(chunks)))
+
+    while len(selected) < k and remaining:
+        if not selected:
+            # First pick: most relevant to query
+            best = max(remaining, key=lambda i: query_sims[i])
+        else:
+            # MMR score: λ×relevance - (1-λ)×max_redundancy
+            sel_vecs = C[selected]
+            best_score, best = -np.inf, remaining[0]
+            for i in remaining:
+                rel = query_sims[i]
+                redundancy = cosine_similarity(C[i:i+1], sel_vecs).max()
+                score = lambda_param * rel - (1 - lambda_param) * redundancy
+                if score > best_score:
+                    best_score, best = score, i
+        selected.append(best)
+        remaining.remove(best)
+
+    return [chunks[i] for i in selected]
+```
+
+### Wiring All Steps Into the Pipeline
+
+```python
+# src/retrieval/full_reranker.py
+from src.retrieval.reranker import cross_encoder_rerank
+from src.retrieval.rule_reranker import rule_based_boost
+from src.retrieval.mmr import mmr_select
+from src.ingestion.embedding.dense_embedder import DenseEmbedder
+
+async def full_rerank_pipeline(
+    query: str,
+    candidates: list[dict],      # N=50 from Qdrant
+    top_k: int = 5,
+) -> list[dict]:
+    """
+    Three-stage reranking:
+    1. Cross-encoder (semantic precision)
+    2. Rule-based boost (recency + authority + keywords)
+    3. MMR diversity filter (remove redundant chunks)
+    """
+    # Stage 1: cross-encoder → reduce N=50 to 20
+    ce_ranked = cross_encoder_rerank(query, candidates, top_n=20)
+
+    # Stage 2: rule-based boost (re-sorts the 20)
+    rule_ranked = rule_based_boost(ce_ranked, query)
+
+    # Stage 3: MMR → reduce 20 to K=5
+    embedder = DenseEmbedder()
+    query_vec = await embedder.embed_query(query)
+    chunk_vecs = await embedder.embed_batch([c["text"] for c in rule_ranked])
+    final = mmr_select(query_vec, rule_ranked, chunk_vecs, k=top_k, lambda_param=0.5)
+
+    return final
+```
+
+### Measuring Reranker Impact (Extended)
+
+```python
+# Run this on your 30-pair golden dataset — records all metrics
+from sklearn.metrics import ndcg_score
+import numpy as np
+
+async def measure_full_reranker_impact(pipeline_before, pipeline_after, golden_path):
+    """
+    Compare RAGAS + NDCG@5 + MRR before and after the full reranking pipeline.
+    Requires golden dataset with graded relevance (0/1/2) for NDCG.
+    """
+    import json
+    with open(golden_path) as f:
+        golden = json.load(f)
+
+    metrics = {"before": {}, "after": {}}
+    for label, pipeline in [("before", pipeline_before), ("after", pipeline_after)]:
+        ndcg_scores, mrr_scores = [], []
+
+        for item in golden:
+            result = await pipeline.retrieve(item["question"])
+            retrieved_ids = [c["chunk_id"] for c in result["chunks"]]
+            relevant_ids = set(item.get("relevant_chunk_ids", []))
+
+            # MRR: rank of first relevant chunk
+            for rank, cid in enumerate(retrieved_ids, 1):
+                if cid in relevant_ids:
+                    mrr_scores.append(1.0 / rank)
+                    break
+            else:
+                mrr_scores.append(0.0)
+
+            # NDCG@5: requires graded relevance in golden dataset
+            if "relevance_grades" in item:
+                y_true = [item["relevance_grades"].get(cid, 0) for cid in retrieved_ids[:5]]
+                y_score = list(range(len(y_true), 0, -1))  # positional scores
+                if sum(y_true) > 0:
+                    ndcg_scores.append(ndcg_score([y_true], [y_score], k=5))
+
+        metrics[label]["mrr"] = round(sum(mrr_scores) / len(mrr_scores), 4)
+        if ndcg_scores:
+            metrics[label]["ndcg_at_5"] = round(sum(ndcg_scores) / len(ndcg_scores), 4)
+
+    # Print comparison
+    print("=== FULL RERANKER IMPACT ===")
+    print(f"{'Metric':25} {'Before':>8} {'After':>8} {'Delta':>8}")
+    print("-" * 55)
+    for metric in ["mrr", "ndcg_at_5"]:
+        b = metrics["before"].get(metric, 0)
+        a = metrics["after"].get(metric, 0)
+        d = a - b
+        print(f"{metric:25} {b:>8.4f} {a:>8.4f} {d:>+8.4f}")
+    print("\nTarget: MRR improves ≥ 0.15, NDCG@5 improves ≥ 0.05")
 ```
 
 ### Phase 12 Checklist
-- [ ] FlashRank installed and imports without error
-- [ ] Reranker takes ≤ 200ms for 20 candidates (time it)
-- [ ] `context_precision` improves ≥ 0.03 after adding reranker
+- [ ] N:K ratio enforced — `TOP_K_FINAL=5`, `QDRANT_PREFETCH_DENSE=50` (10:1)
+- [ ] Startup assertion passes: `prefetch >= top_k * 6`
+- [ ] FlashRank cross-encoder: ≤ 200ms for 50 candidates
+- [ ] Rule-based boost: recency + authority both tested with real docs (verify newer docs rank higher)
+- [ ] MMR: run with 5 similar chunks — verify final selection is diverse
+- [ ] `context_precision` improves ≥ 0.03 vs no reranker
+- [ ] MRR improves ≥ 0.10 vs no reranker (first relevant chunk appears earlier)
 - [ ] HyDE tested on 3 queries where standard search returned poor results
-- [ ] Context ordering (best first + last) measurably improves faithfulness
+- [ ] Context ordering (best chunk first, 2nd-best last) applied in context_assembler.py
 
 ---
 
@@ -1666,7 +1905,7 @@ curl http://localhost:8001   # RedisInsight should load
 ### Install
 
 ```powershell
-pip install redisvl==0.3.6 langchain-redis==0.1.0 "redis[asyncio]==5.0.1"
+uv add redisvl==0.3.6 langchain-redis==0.1.0 "redis[asyncio]==5.0.1"
 ```
 
 ### Add to .env

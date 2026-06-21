@@ -1068,10 +1068,7 @@ ollama pull llama3.2:70b        # (40GB — you have 64GB, it fits)
 ```powershell
 git clone https://github.com/yourname/production-rag-qdrant.git
 cd production-rag-qdrant
-python -m venv .venv
-.venv\Scripts\activate
-pip install --upgrade pip
-pip install -r requirements.txt
+uv sync  # creates .venv and installs all deps from pyproject.toml
 copy .env.example .env
 notepad .env
 ```
@@ -1253,7 +1250,7 @@ curl -X POST http://localhost:8000/api/v1/query/sync `
 production-rag-qdrant/
 ├── docker-compose.yml
 ├── .env.example
-├── requirements.txt
+├── pyproject.toml
 ├── alembic.ini
 │
 ├── alembic/
@@ -1379,7 +1376,7 @@ production-rag-qdrant/
 
 Docker Compose and `.env` shown in Section 10. Key difference from v1: **no pgvector extension**, PostgreSQL is plain `postgres:16-alpine`.
 
-**`requirements.txt`**:
+**`pyproject.toml`**:
 ```
 # Core
 fastapi==0.115.0
@@ -3067,7 +3064,7 @@ HTTP Response
 ### 17.8 Updated Requirements for v2
 
 ```
-# ADD to requirements.txt:
+# ADD to pyproject.toml (via: uv add):
 redisvl==0.3.6
 langchain-redis==0.1.0
 redis[asyncio]==5.0.1
