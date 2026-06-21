@@ -1,0 +1,204 @@
+# docker-compose.yml — Production RAG System
+# Single file. All services. Run from project root.
+#
+# START:   docker compose up -d
+# STOP:    docker compose down
+# REBUILD: docker compose up -d --build
+# LOGS:    docker compose logs -f <service>
+# STATUS:  docker compose ps
+
+services:
+
+  # ─── POSTGRESQL 16 ────────────────────────────────────────────────────────
+  # Source of truth: document text, chunks, metadata, audit trail
+  # Uses postgres:16-alpine — NOT pgvector (vectors live in Qdrant)
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpassword
+      POSTGRES_DB: ragdb
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data-volume/postgres_data:/var/lib/postgresql/data
+      # Init script runs ONCE on first container creation
+      # Creates all 8 tables automatically — no alembic needed
+      - ./docker/init:/docker-entrypoint-initdb.d:ro      
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rag_net
+
+  # ─── QDRANT ───────────────────────────────────────────────────────────────
+  # Vector index: dense (768-dim nomic-embed-text) + sparse (SPLADE) + RRF
+  # Dashboard: http://localhost:6333/dashboard
+  # Python client uses gRPC port 6334 (prefer_grpc=True)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: rag_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"    # HTTP REST API + dashboard
+      - "6334:6334"    # gRPC — used by Python client
+    volumes:
+      - ./data-volume/qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__TELEMETRY_DISABLED: "false"
+      QDRANT__LOG_LEVEL: "INFO"
+    # healthcheck:
+    #   test: ["CMD-SHELL", "wget -qO- http://localhost:6333/healthz | grep -q qdrant || exit 1"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+    #   start_period: 15s
+    networks:
+      - rag_net
+
+  # ─── REDIS STACK ──────────────────────────────────────────────────────────
+  # DB 0 Celery broker + result backend
+  # DB 1 Semantic cache (redisvl HNSW on query vectors)
+  # MUST be redis/redis-stack NOT redis:alpine (needs RedisSearch module)
+  # RedisInsight: http://localhost:8001
+  redis:
+    image: redis/redis-stack:latest
+    container_name: rag_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"    # Redis protocol
+      - "8001:8001"    # RedisInsight dashboard
+    volumes:
+      - ./data-volume/redis_data:/data
+    environment:
+      REDIS_ARGS: "--appendonly yes --maxmemory 4gb --maxmemory-policy allkeys-lru --save 60 1000"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rag_net
+
+  # ─── MINIO ────────────────────────────────────────────────────────────────
+  # Raw file storage: PDF, DOCX, HTML uploads
+  # S3 API:  http://localhost:9000
+  # Console: http://localhost:9001  (minioadmin / minioadmin123)
+  minio:
+    image: minio/minio:latest
+    container_name: rag_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data-volume/minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rag_net
+
+  # ─── CELERY WORKER ────────────────────────────────────────────────────────
+  # Async ingestion: parse -> chunk -> embed -> upsert PG + Qdrant
+  # src/ mounted as volume for hot reload in development
+  # Ollama runs on Windows host — accessed via host.docker.internal
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_celery_worker
+    restart: unless-stopped
+    command: >
+      uv run celery -A src.workers.celery_app worker
+      --loglevel=info
+      -Q ingestion
+      --concurrency=4
+      --max-tasks-per-child=100
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      DATABASE_URL: postgresql+asyncpg://raguser:ragpassword@postgres:5432/ragdb
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_GRPC_PORT: "6334"
+      QDRANT_USE_GRPC: "true"
+      QDRANT_COLLECTION: rag_chunks
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      MINIO_BUCKET: rag-documents
+      MINIO_SECURE: "false"
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      EMBEDDING_MODEL: nomic-embed-text
+      EMBEDDING_DIMENSIONS: "768"
+      LLM_MODEL: llama3.2:8b
+      LLM_PROVIDER: ollama
+      CHUNK_SIZE_TOKENS: "400"
+      CHUNK_OVERLAP_TOKENS: "50"
+      TOP_K_FINAL: "5"
+      LOG_LEVEL: INFO
+      PYTHONPATH: /app
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy        
+      qdrant:
+        condition: service_started
+
+    networks:
+      - rag_net
+
+  # ─── FLOWER ───────────────────────────────────────────────────────────────
+  # Celery task monitor: http://localhost:5555
+  flower:
+    image: mher/flower:2.0.1
+    container_name: rag_flower
+    restart: unless-stopped
+    command: celery flower --broker=redis://redis:6379/0 --port=5555
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rag_net
+
+# ─── VOLUMES ──────────────────────────────────────────────────────────────────
+# Persist across: docker compose down / up
+# Delete with:    docker compose down -v
+# volumes:
+#   postgres_data:
+#   qdrant_data:
+#   redis_data:
+#   minio_data:
+
+# ─── NETWORK ──────────────────────────────────────────────────────────────────
+# Containers reach each other by service name (postgres, qdrant, redis, minio)
+# FastAPI runs on Windows host and connects via localhost
+networks:
+  rag_net:
+    driver: bridge

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Engineering Blog — Acme Corporation</title>
+  <meta name="description" content="How we built a production RAG system at Acme Engineering">
+  <meta name="author" content="Platform Engineering Team">
+  <meta name="date" content="2026-06-21">
+</head>
+<body>
+
+  <!-- NAVIGATION — should be stripped by HTML parser -->
+  <nav id="main-nav" class="navbar">
+    <div class="logo"><a href="/">Acme Engineering Blog</a></div>
+    <ul class="nav-links">
+      <li><a href="/articles">Articles</a></li>
+      <li><a href="/about">About</a></li>
+      <li><a href="/contact">Contact</a></li>
+      <li><a href="/careers">We're Hiring</a></li>
+    </ul>
+    <div class="search-bar">
+      <input type="text" placeholder="Search articles...">
+      <button>Search</button>
+    </div>
+  </nav>
+
+  <!-- HEADER BANNER — should be stripped -->
+  <header class="site-header hero-banner">
+    <div class="hero-content">
+      <span class="tag">Engineering</span>
+      <h1 class="hero-title">How We Built Our Production RAG System</h1>
+      <p class="hero-subtitle">From prototype to 10,000 queries per day in 90 days</p>
+      <div class="author-meta">
+        <img src="/authors/platform-team.jpg" alt="Platform Team">
+        <span>Platform Engineering Team · June 21, 2026 · 12 min read</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- SIDEBAR AD — should be stripped -->
+  <aside class="ad-unit" id="sidebar-ad">
+    <p>Advertisement</p>
+    <img src="/ads/banner.jpg" alt="Sponsored content">
+    <a href="/sponsor">Click here to learn more</a>
+  </aside>
+
+  <!-- MAIN ARTICLE CONTENT — should be preserved -->
+  <main>
+    <article class="blog-post" itemscope itemtype="http://schema.org/Article">
+
+      <h1 itemprop="headline">How We Built a Production RAG System at Acme Engineering</h1>
+
+      <h2>Background and Motivation</h2>
+
+      <p>Acme's engineering organisation grew from 20 to 85 engineers in 18 months.
+      That growth is exciting, but it created a knowledge problem: new engineers spent
+      their first two weeks reading through Confluence pages, Notion docs, Slack threads,
+      and Google Docs trying to understand how things worked. Senior engineers were
+      spending 3–4 hours per week answering questions that were already documented
+      somewhere.</p>
+
+      <p>We decided to build an internal knowledge assistant that could answer engineering
+      questions from our existing documents. This article describes what we built, what
+      we got wrong, and what we would do differently.</p>
+
+      <h2>Architecture Overview</h2>
+
+      <p>After evaluating several approaches, we settled on a hybrid Retrieval-Augmented
+      Generation (RAG) architecture. The high-level components are:</p>
+
+      <ul>
+        <li><strong>Document ingestion pipeline</strong> — parses PDF, DOCX, HTML, and
+        Confluence exports into structured chunks</li>
+        <li><strong>Dual embedding</strong> — dense embeddings (768-dim, nomic-embed-text)
+        and sparse SPLADE embeddings stored in Qdrant</li>
+        <li><strong>Hybrid retrieval</strong> — dense + sparse search fused with Reciprocal
+        Rank Fusion (RRF), giving 14% recall improvement over dense-only</li>
+        <li><strong>Three-stage reranker</strong> — FlashRank cross-encoder → rule-based
+        recency/authority boost → MMR diversity filter</li>
+        <li><strong>LangGraph reasoning engine</strong> — stateful graph with 3-agent
+        system (Retriever, Reasoner, Verifier)</li>
+        <li><strong>Semantic cache</strong> — Redis Stack with redisvl, reducing LLM calls
+        by 34% within the first month</li>
+      </ul>
+
+      <h2>What We Measured</h2>
+
+      <p>We used RAGAS to evaluate our system at each major milestone. The table below
+      shows our scores across four evaluation runs:</p>
+
+      <table border="1" class="metrics-table">
+        <thead>
+          <tr>
+            <th>Milestone</th>
+            <th>Faithfulness</th>
+            <th>Answer Relevancy</th>
+            <th>Context Precision</th>
+            <th>Cache Hit Rate</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>v0.1 — Naive RAG (no reranker)</td>
+            <td>0.61</td>
+            <td>0.68</td>
+            <td>0.54</td>
+            <td>N/A</td>
+          </tr>
+          <tr>
+            <td>v0.2 — Added FlashRank reranker</td>
+            <td>0.72</td>
+            <td>0.71</td>
+            <td>0.73</td>
+            <td>N/A</td>
+          </tr>
+          <tr>
+            <td>v0.3 — Added semantic cache</td>
+            <td>0.79</td>
+            <td>0.75</td>
+            <td>0.78</td>
+            <td>22%</td>
+          </tr>
+          <tr>
+            <td>v0.4 — Production (MMR + rule boost)</td>
+            <td>0.84</td>
+            <td>0.78</td>
+            <td>0.82</td>
+            <td>34%</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>The biggest single improvement was adding the FlashRank cross-encoder reranker
+      with a 10:1 N:K ratio (50 candidates → top 5). Context precision jumped from 0.54
+      to 0.73 — the reranker filtered out a lot of plausible-sounding but actually
+      irrelevant chunks that were hurting faithfulness.</p>
+
+      <h2>The Biggest Mistake We Made</h2>
+
+      <p>We spent two weeks building a beautiful LangGraph agent orchestration system
+      before we had confirmed that basic retrieval quality was good enough. When we
+      finally ran RAGAS, our baseline faithfulness was 0.61 — well below our target of
+      0.80. We had to pause agent work and spend another week fixing chunking.</p>
+
+      <p>The lesson: <strong>retrieval quality is the foundation</strong>. An agent
+      system on top of bad retrieval is just a faster way to produce confident wrong
+      answers. Measure RAGAS on a basic pipeline first. Only add agents when your
+      context precision and faithfulness are already acceptable.</p>
+
+      <h2>Chunking: The Underrated Foundation</h2>
+
+      <p>Our first attempt at chunking used LangChain's RecursiveCharacterTextSplitter
+      with a 500-token limit. It produced chunks like this:</p>
+
+      <blockquote>
+        "...should be submitted via the HR Portal at least 30 days in advance. For unforeseen
+        events, employees should | Column A | Column B | 1 | 2 | 3 | 4 | notify HR as soon
+        as practicable..."
+      </blockquote>
+
+      <p>We had split a table mid-row and merged it with surrounding prose. The resulting
+      chunk was unchunkable by the embedding model — neither the table data nor the
+      surrounding text was retrievable with any query.</p>
+
+      <p>Our custom SmartChunker addresses this with one non-negotiable rule:
+      <strong>tables are always one chunk, never split</strong>. We detect tables by their
+      bounding box in pdfplumber and exclude them from prose splitting. This change alone
+      improved our context recall by 0.12.</p>
+
+      <h2>What Is Next</h2>
+
+      <p>We are planning three improvements for Q3 2026:</p>
+
+      <ol>
+        <li><strong>Corrective RAG (CRAG)</strong> — when retrieval confidence is below
+        0.6, fall back to a web search to supplement context</li>
+        <li><strong>Parent-child chunking</strong> — index small chunks (128 tokens) for
+        retrieval precision, but serve the parent paragraph (512 tokens) to the LLM</li>
+        <li><strong>Streaming responses</strong> — the current synchronous API returns
+        the full answer at once; streaming will reduce perceived latency from 2.1s to
+        first-token latency of ~200ms</li>
+      </ol>
+
+      <p>If you are building something similar, the most important advice we can give is:
+      measure first, build second. RAGAS is free, takes 10 minutes to set up, and will
+      tell you exactly where your system is failing before you spend a week building agents
+      on top of broken retrieval.</p>
+
+      <h3>Further Reading</h3>
+      <ul>
+        <li><a href="https://arxiv.org/abs/2212.10496">HyDE paper (Gao et al. 2022)</a></li>
+        <li><a href="https://arxiv.org/abs/2307.03172">Lost in the Middle (Liu et al. 2023)</a></li>
+        <li><a href="https://docs.ragas.io">RAGAS documentation</a></li>
+        <li><a href="https://qdrant.tech/documentation">Qdrant documentation</a></li>
+      </ul>
+
+    </article>
+  </main>
+
+  <!-- RELATED POSTS SIDEBAR — should be stripped -->
+  <aside class="related-posts">
+    <h4>Related Articles</h4>
+    <ul>
+      <li><a href="/articles/vector-databases">Choosing a Vector Database in 2026</a></li>
+      <li><a href="/articles/langgraph-agents">LangGraph in Production</a></li>
+    </ul>
+  </aside>
+
+  <!-- FOOTER — should be stripped -->
+  <footer class="site-footer">
+    <div class="footer-links">
+      <a href="/privacy">Privacy Policy</a>
+      <a href="/terms">Terms of Service</a>
+      <a href="/cookies">Cookie Policy</a>
+      <a href="/sitemap">Sitemap</a>
+    </div>
+    <p class="copyright">© 2026 Acme Corporation. All rights reserved.</p>
+    <div class="social-links">
+      <a href="https://twitter.com/acme">Twitter</a>
+      <a href="https://linkedin.com/company/acme">LinkedIn</a>
+      <a href="https://github.com/acme-corp">GitHub</a>
+    </div>
+  </footer>
+
+  <!-- COOKIE BANNER — should be stripped -->
+  <div id="cookie-banner" class="cookie-consent">
+    <p>We use cookies to improve your experience. 
+       <a href="/cookies">Learn more</a>
+       <button onclick="acceptCookies()">Accept</button>
+       <button onclick="rejectCookies()">Reject</button>
+    </p>
+  </div>
+
+  <script>
+    // Analytics and tracking — should be stripped
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'GA-XXXX-XXXX');
+
+    function acceptCookies() {
+      document.getElementById('cookie-banner').style.display = 'none';
+      localStorage.setItem('cookies', 'accepted');
+    }
+    function rejectCookies() {
+      document.getElementById('cookie-banner').style.display = 'none';
+    }
+  </script>
+
+</body>
+</html>

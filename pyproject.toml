@@ -1,7 +1,81 @@
 [project]
-name = "production-grade-rag"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+name = "production-rag"
+version = "0.4.0"
+description = "Production-grade RAG system with Qdrant hybrid search"
+requires-python = ">=3.12"
+
+dependencies = [
+    # API
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.6",
+    "gunicorn>=22.0.0",
+    "pydantic-settings>=2.5.2",
+
+    # Database
+    "asyncpg>=0.29.0",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "alembic>=1.13.3",
+
+    # Vector DB
+    "qdrant-client>=1.11.0",
+    "fastembed>=0.3.6",
+
+    # Embeddings + LLM
+    "langchain>=0.3.0",
+    "langchain-ollama>=0.2.0",
+    "langgraph>=0.2.16",
+
+    # Parsing
+    "pdfplumber>=0.11.4",
+    "python-docx>=1.1.2",
+    "beautifulsoup4>=4.12.3",
+    "tiktoken>=0.7.0",
+
+    # Reranking
+    "flashrank>=0.2.0",
+    "scikit-learn>=1.5.0",
+    "numpy>=1.26.0",
+
+    # Task queue
+    "celery[redis]>=5.4.0",
+    "flower>=2.0.1",
+
+    # Object storage
+    "minio>=7.2.9",
+
+    # Semantic cache
+    "redisvl>=0.3.6",
+    "langchain-redis>=0.1.0",
+    "redis[asyncio]>=5.0.1",
+
+    # Evaluation
+    "ragas>=0.1.21",
+    "datasets>=2.20.0",
+
+    # Observability
+    "structlog>=24.4.0",
+
+    # Utilities
+    "python-multipart>=0.0.9",
+    "httpx>=0.27.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Tell hatchling where the source code lives
+# Without this it looks for a production_rag/ directory and fails
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-timeout>=2.3.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
